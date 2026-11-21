@@ -126,17 +126,50 @@ def send_telegram_notification(status, old_due="未知", new_due="未知", curre
             log(f"❌ Telegram 代理通知异常: {e}")
     return False
 
-def _safe_click(locator, timeout=15000):
-    locator.wait_for(state="visible", timeout=timeout)
+def dismiss_overlays(page):
+    """移除遮挡点击的 GDPR Cookie 弹窗（#ncmp__tool）等浮层"""
     try:
-        locator.scroll_into_view_if_needed(timeout=5000)
+        removed = page.evaluate(
+            """
+            () => {
+                const selectors = [
+                    '#ncmp__tool',
+                    '.ncmp__banner',
+                    '.ncmp__banner-inner',
+                    '.ncmp_normalize',
+                    '[id^="ncmp__"]',
+                    '.fc-consent-root'
+                ];
+                let count = 0;
+                for (const sel of selectors) {
+                    document.querySelectorAll(sel).forEach(el => {
+                        el.remove();
+                        count++;
+                    });
+                }
+                return count;
+            }
+            """
+        )
+        if removed:
+            log(f"🧹 已清理 {removed} 个 Cookie/浮层遮罩")
+    except Exception:
+        pass
+
+def _safe_click(page, locator, timeout=6000):
+    """清理遮罩后优先常规点击；若仍受阻，回退 JS 原生点击（彻底无视坐标遮挡）"""
+    dismiss_overlays(page)
+    locator.wait_for(state="visible", timeout=max(timeout, 10000))
+    try:
+        locator.scroll_into_view_if_needed(timeout=3000)
     except Exception:
         pass
     try:
         locator.click(timeout=timeout)
     except Exception as e:
-        log(f"⚠️ 常规点击受阻（可能被广告遮挡），尝试强制点击: {e}")
-        locator.click(force=True, timeout=timeout)
+        log(f"⚠️ 常规点击受阻，清理遮罩后改用 JS 原生点击: {str(e).splitlines()[0]}")
+        dismiss_overlays(page)
+        locator.evaluate("el => el.click()")
 
 def _get_turnstile_token(page):
     try:
@@ -332,6 +365,7 @@ def handle_cloudflare(page, timeout=240):
 
 def solve_modal_turnstile(page, timeout=90):
     log("🛡️ 开始处理 Turnstile 验证...")
+    dismiss_overlays(page)
     start = time.time()
     last_click = 0
     clicks = 0
@@ -571,11 +605,11 @@ def get_server_id(page, current_ip="未知"):
         try:
             filter_btn = page.locator('button:has-text("Filter")').first
             if filter_btn.count() > 0:
-                _safe_click(filter_btn, timeout=5000)
+                _safe_click(page, filter_btn, timeout=5000)
                 time.sleep(1)
                 suspended_opt = page.locator('text=/Suspended/i').first
                 if suspended_opt.count() > 0:
-                    _safe_click(suspended_opt, timeout=5000)
+                    _safe_click(page, suspended_opt, timeout=5000)
                     time.sleep(3)
                     server_id = _extract_server_id_from_page(page)
                     if server_id:
@@ -616,53 +650,61 @@ def get_due_date(page):
 
 def _is_renewal_restricted(page):
     try:
-        body_text = page.locator("body").inner_text(timeout=5000)
+        body_text = page.locator("body").inner_text(timeout=3000)
         lower_text = body_text.lower()
         markers = (
             "renewal restricted",
             "can only renew",
-            "cannot renew this service yet",
+            "cannot renew",
+            "not due",
             "not eligible for renewal",
             "too early to renew",
+            "before the due date",
+            "before due date",
         )
-        return any(m in lower_text for m in markers)
+        for m in markers:
+            if m in lower_text:
+                log(f"ℹ️ 匹配到续期限制关键词: '{m}'")
+                return True
+        return False
     except Exception:
         return False
 
 def renew_service(page):
     try:
         log("➡ 进入续期流程...")
-        for renew_round in range(3):
+        for renew_round in range(2):
             if renew_round > 0:
                 log(f"🔄 开始第 {renew_round + 1} 轮续期重试...")
             if page.url != SERVICE_URL or "/auth/login" in (page.url or ""):
                 page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
             handle_cloudflare(page)
-            time.sleep(5)
+            time.sleep(4)
+            dismiss_overlays(page)
 
             log("🖱️ 准备点击 Renew 按钮...")
             renew_btn = page.locator('button:has-text("Renew"), a:has-text("Renew")').first
             create_btn = page.locator('button:has-text("Create Invoice")').first
             modal_opened = False
 
-            for i in range(6):
+            for i in range(4):
                 try:
                     log(f"🖱️ 第 {i+1} 次尝试点击 Renew...")
-                    _safe_click(renew_btn, timeout=10000)
+                    _safe_click(page, renew_btn, timeout=6000)
                     time.sleep(2)
-
-                    try:
-                        create_btn.wait_for(state="visible", timeout=6000)
-                        modal_opened = True
-                        log("✅ 续期弹窗已成功弹出（检测到 Create Invoice）！")
-                        break
-                    except Exception:
-                        pass
 
                     if _is_renewal_restricted(page):
                         log("⚠️ 检测到续期限制提示（未到续期时间），本次跳过。")
                         page.screenshot(path="renew_not_allowed.png")
                         return "NOT_TIME"
+
+                    try:
+                        create_btn.wait_for(state="visible", timeout=5000)
+                        modal_opened = True
+                        log("✅ 续期弹窗已成功弹出（检测到 Create Invoice）！")
+                        break
+                    except Exception:
+                        pass
 
                     log("⚠️ 弹窗未出现，可能是点击未响应，准备重试...")
                     time.sleep(2)
@@ -682,12 +724,12 @@ def renew_service(page):
 
             new_invoice_url = None
             kicked_to_login = False
-            time.sleep(2)
+            time.sleep(1)
 
-            for attempt in range(6):
+            for attempt in range(4):
                 log(f"🖱️ 点击 Create Invoice（第 {attempt + 1} 次）...")
                 try:
-                    _safe_click(create_btn, timeout=20000)
+                    _safe_click(page, create_btn, timeout=6000)
                 except Exception as e:
                     log(f"⚠️ 点击 Create Invoice 失败: {e}")
                     solve_modal_turnstile(page, timeout=45)
@@ -695,7 +737,7 @@ def renew_service(page):
                     continue
 
                 start_wait = time.time()
-                while time.time() - start_wait < 30:
+                while time.time() - start_wait < 20:
                     cur_url = page.url or ""
                     if "/payment/invoice/" in cur_url:
                         new_invoice_url = cur_url
@@ -705,6 +747,10 @@ def renew_service(page):
                         kicked_to_login = True
                         log(f"⚠️ 点击 Create Invoice 后跳回登录页: {cur_url}")
                         break
+                    if _is_renewal_restricted(page):
+                        log("⚠️ 提交后检测到续期限制提示（未到续期时间），停止重试。")
+                        page.screenshot(path="renew_not_allowed.png")
+                        return "NOT_TIME"
                     if _has_interstitial_iframe(page) or _is_security_check_page(page):
                         log("⚠️ 遇到整页拦截，尝试处理...")
                         handle_cloudflare(page, timeout=60)
@@ -713,7 +759,7 @@ def renew_service(page):
                 if new_invoice_url or kicked_to_login:
                     break
 
-                log("⚠️ 未跳转到发票页面，尝试重新完成 Turnstile 验证后重试...")
+                log("⚠️ 未跳转到发票页面，检查验证状态后重试...")
                 solve_modal_turnstile(page, timeout=45)
 
             if new_invoice_url:
@@ -737,11 +783,12 @@ def renew_service(page):
         if page.url != new_invoice_url:
             page.goto(new_invoice_url, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
+        dismiss_overlays(page)
         solve_modal_turnstile(page, timeout=45)
 
         log("🔎 查找 Pay 按钮...")
         pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
-        _safe_click(pay_btn, timeout=30000)
+        _safe_click(page, pay_btn, timeout=10000)
         log("✅ Pay 按钮已点击，等待支付确认...")
         time.sleep(8)
 
