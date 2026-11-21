@@ -3,7 +3,8 @@ name: Auto Renew HidenCloud
 on:
   workflow_dispatch:
   schedule:
-    - cron: '30 23 * * 0' # 根据到期时间的前一天推算星期几来续期，最后一个数字代表星期
+    # 每天 UTC 01:23（北京时间 09:23）仅做本地日期检查，未到到期前1天直接跳过，不登录站点
+    - cron: '23 1 * * *'
 
 permissions:
   contents: write
@@ -21,13 +22,53 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           persist-credentials: true
 
+      - name: 📅 本地检查是否进入续期窗口（不登录）
+        id: check_due
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "🔧 手动触发，跳过本地日期拦截，直接执行"
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          python3 - << 'EOF'
+          import os
+          from datetime import datetime, timezone, timedelta
+
+          due_file = "due_date.txt"
+          if not os.path.exists(due_file):
+              print("📄 未找到 due_date.txt，执行一次以获取到期日")
+              should_run = True
+          else:
+              raw = open(due_file, "r", encoding="utf-8").read().strip()
+              try:
+                  due = datetime.strptime(raw, "%Y-%m-%d").date()
+                  # 按 UTC 日期判断（HidenCloud 面板为 UTC/欧洲时间）
+                  today = datetime.now(timezone.utc).date()
+                  days_left = (due - today).days
+                  print(f"📅 当前UTC日期: {today}, 记录到期日: {due}, 剩余天数: {days_left} 天")
+                  if days_left <= 1:
+                      print("✅ 已进入到期前1天续期窗口，准备启动续期")
+                      should_run = True
+                  else:
+                      print("😴 未到续期窗口，本次直接跳过（不启动浏览器、不登录）")
+                      should_run = False
+              except Exception as e:
+                  print(f"⚠️ due_date.txt 格式异常 ({raw}): {e}，执行一次以校准")
+                  should_run = True
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"should_run={'true' if should_run else 'false'}\n")
+          EOF
 
       - name: ⚙ 设置 Python
+        if: steps.check_due.outputs.should_run == 'true'
         uses: actions/setup-python@v6
         with:
           python-version: '3.13'
 
       - name: 🛠️ 安装系统依赖和python依赖
+        if: steps.check_due.outputs.should_run == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb
@@ -35,6 +76,7 @@ jobs:
           python -m patchright install --with-deps chrome
 
       - name: ⚙ 设置sing-box代理
+        if: steps.check_due.outputs.should_run == 'true'
         continue-on-error: true
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
@@ -42,30 +84,33 @@ jobs:
           bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
 
       - name: 🚀 运行续期脚本
+        if: steps.check_due.outputs.should_run == 'true'
         env:
           EMAIL: ${{ secrets.EMAIL }}
-          # PASSWORD: ${{ secrets.PASSWORD }}
           REGION: ${{ secrets.REGION }}
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
-          # COOKIE_VALUE: ${{ secrets.COOKIE_VALUE }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          SERVER_ID: ${{ secrets.SERVER_ID }}
         run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python -u app.py
 
-      # 更新时间到time.txt,避免6个月未更新导致工作流暂停
-      - name: 🕒 更新时间
+      - name: 🕒 提交最新到期日与运行时间
+        if: always() && steps.check_due.outputs.should_run == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           echo "$(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')" > time.txt
           git add time.txt
+          if [ -f due_date.txt ]; then
+            git add due_date.txt
+          fi
           if git diff --cached --quiet; then
             echo "No need to commit"
           else
             git commit -m "⏱️ Auto Update by Github Actions $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')"
             git push origin main
           fi
-      
+
       - name: 🧹 清理旧的工作流运行记录
         if: always()
         env:
@@ -75,7 +120,7 @@ jobs:
           count=0
           for run_id in $runs; do
             count=$((count + 1))
-            if [ $count -gt 1 ]; then
+            if [ $count -gt 10 ]; then
               echo "删除运行记录: $run_id"
               gh run delete $run_id || true
             fi
